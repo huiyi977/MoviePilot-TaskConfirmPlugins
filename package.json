@@ -4,7 +4,7 @@
     "description": "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后自动添加订阅。",
     "labels": "媒体,订阅,任务确认",
     "version": "1.0.0",
-    "icon": "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/master/icons/taskconfirmbridge.png",
+    "icon": "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmbridge.png",
     "author": "huiyi977",
     "level": 1,
     "system_version": ">=3.0.0",
