@@ -3,12 +3,13 @@
     "name": "任务确认桥接",
     "description": "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后自动添加订阅。",
     "labels": "媒体,订阅,任务确认",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/master/icons/taskconfirmbridge.png",
     "author": "huiyi977",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.1": "发布到在线插件市场；新增市场图标与仓库说明。",
       "v1.0.0": "首次发布：mp 搜索词 → 候选确认 → 自动订阅。"
     }
   }

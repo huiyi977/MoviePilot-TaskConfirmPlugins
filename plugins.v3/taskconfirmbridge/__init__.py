@@ -24,7 +24,7 @@ class TaskConfirmBridge(_PluginBase):
     plugin_name = "任务确认桥接"
     plugin_desc = "把 MP 搜索词转成任务确认中心的候选确认卡片，选好后自动添加订阅。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "user"
     author_url = ""
     plugin_config_prefix = "taskconfirmbridge_"
