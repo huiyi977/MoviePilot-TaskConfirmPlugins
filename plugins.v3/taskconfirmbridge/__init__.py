@@ -29,7 +29,7 @@ class TaskConfirmBridge(_PluginBase):
     plugin_name = "任务确认桥接"
     plugin_desc = "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，二次选定后自动调用默认下载器下载。"
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmbridge.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmbridge_"
@@ -498,7 +498,7 @@ class TaskConfirmBridge(_PluginBase):
             name_map[key] = it["name"]
 
         payload = {
-            "title": f"下载器选择：{torrent_text.split('｜')[0][:28]}",
+            "title": f"下载器选择：{self._clean_torrent_title(torrent_text)}"[:64],
             "sub_title": "TaskConfirmBridge · 阶段 3/3 · 请选择下载器",
             "style": "text",
             "options": options,
@@ -574,6 +574,15 @@ class TaskConfirmBridge(_PluginBase):
                 f"❌ 添加下载失败（{used}）：{self._torrent_short_title(ti)}",
                 f"{torrent_text}\n任务：{job.get('task_id')}",
             )
+
+    @staticmethod
+    def _clean_torrent_title(torrent_text: str) -> str:
+        """把「1. 标题｜大小｜站点｜⬆做种」压成纯标题（去序号与后续字段）。"""
+        first = str(torrent_text or "").split("｜")[0].strip()
+        parts = first.split(". ", 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            first = parts[1]
+        return first[:40] or "未知资源"
 
     @staticmethod
     def _torrent_short_title(ti) -> str:
