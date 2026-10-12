@@ -3,14 +3,14 @@
 
 把原先独立部署的「任务确认中心」（server.py）**内嵌进插件**：
 插件启动时在容器内拉起一个 FastAPI 服务（默认 0.0.0.0:8005），
-只保留「确认卡片」这一条业务线，指令框只保留 `mp <搜索词>`，专配 MoviePilot。
+只保留「确认卡片」这一条业务线，指令框**直接输入搜索词**，专配 MoviePilot。
 
-链路：H5 指令框 `mp 搜索词` → 插件搜索媒体 → 候选卡片（阶段 1）
+链路：H5 指令框 `搜索词` → 插件搜索媒体 → 候选卡片（阶段 1）
       → 选媒体 → 站点资源卡片（阶段 2）→ 选资源 → 自动/指定下载器下载（阶段 3）。
 
 与原 server.py 的差异（精简）：
   · 去掉「电影海报 2:3 截图（crop）」与「视频截图多选（frame）」两条业务线
-  · 去掉图床上传 / 图片代理 / 设备切换，指令框与帮助只保留 mp
+  · 去掉图床上传 / 图片代理 / 设备切换，指令框只接收搜索词（无需前缀）
   · 去掉了与外部确认中心之间的 HTTP 往返：任务在进程内直接创建与等待
   · 通知沿用通知中心脚本（bark-we-go.sh，规范 1.4），并内置 Python 兜底
 """
@@ -55,15 +55,15 @@ DEFAULT_MINIMAL_TEXT = "【待处理确认】\\n{time} 你有一条待处理确�
 
 HELP_TEXT = """⚡ 任务确认中心 Max - 指令帮助
 
-【MP 媒体搜索指令】
-  mp <搜索词>  例如：mp 蜘蛛侠
+【MP 媒体搜索】
+  直接输入搜索词  例如：蜘蛛侠
     说明：把搜索词交给 MoviePilot 搜索媒体 → 候选列表推回本页（阶段 1）
           → 选中媒体后自动搜索站点资源（阶段 2，含 标题/大小/站点/做种数）
           → 选中资源后自动调用下载器下载（阶段 3）。
 
 【使用提示】
-  · 输入指令后点「发送」或敲回车即可执行
-  · 本版本为 MP 专配版，只保留 mp 一条指令
+  · 输入搜索词后点「发送」或敲回车即可执行
+  · 本版本为 MP 专配版，输入的内容一律当作搜索词处理
 """
 
 PAGE_TEMPLATE = """<!doctype html>
@@ -174,7 +174,7 @@ footer{margin-top:26px;text-align:center;font-size:12px;color:var(--sub)}
   <!-- MP 搜索指令区域 -->
   <div class="cmd-card">
     <div class="cmd-box">
-      <input type="text" id="cmd-input" placeholder="输入 mp 搜索词，如：mp 蜘蛛侠">
+      <input type="text" id="cmd-input" placeholder="输入搜索词，如：蜘蛛侠">
       <button id="cmd-btn">发送</button>
     </div>
   </div>
@@ -222,11 +222,11 @@ footer{margin-top:26px;text-align:center;font-size:12px;color:var(--sub)}
   function dropId(id){CUR_IDS=CUR_IDS.split(',').filter(function(x){return x&&x!==id}).join(',')}
   function pageToken(){return new URLSearchParams(window.location.search).get('token')||''}
 
-  // 指令发送（只支持 mp）
+  // 指令发送（直接输入搜索词）
   var cmdBtn=document.getElementById('cmd-btn'), cmdInput=document.getElementById('cmd-input');
   function sendCmd(){
     var val=(cmdInput.value||'').trim();
-    if(!val) return toast('请先输入指令，如：mp 蜘蛛侠');
+    if(!val) return toast('请先输入搜索词，如：蜘蛛侠');
     cmdBtn.disabled=true;
     var token=pageToken();
     fetch('/api/v1/command',{
@@ -912,19 +912,20 @@ class _ConfirmServer:
                 if not _const_eq(S._provided_token(request, body.get("token") or ""), S.api_token):
                     raise HTTPException(status_code=401, detail="鉴权失败：无权的指令发送")
 
-            parts = cmd.split(None, 1)
-            head = parts[0].lower() if parts else ""
-            if head != "mp":
-                return {"ok": False, "msg": "本版本只支持「mp <搜索词>」指令"}
-            keyword = parts[1].strip() if len(parts) > 1 else ""
+            # MP 专配版：整条输入即搜索词（兼容旧习惯，写了 `mp ` 前缀会被自动剥掉）
+            keyword = cmd
+            if keyword.lower() == "mp":
+                keyword = ""
+            elif keyword[:3].lower() == "mp ":
+                keyword = keyword[3:].strip()
             if not keyword:
-                return {"ok": False, "msg": "用法：mp <搜索词>，例如「mp 蜘蛛侠」"}
+                return {"ok": False, "msg": "请直接输入搜索词，例如「蜘蛛侠」"}
             if S.command_hook is None:
                 return {"ok": False, "msg": "插件命令处理器未就绪"}
             try:
                 res = S.command_hook(keyword) or {}
             except Exception as e:  # noqa: BLE001
-                logger.error(f"TaskConfirmMax 处理 mp 指令失败：{e}")
+                logger.error(f"TaskConfirmMax 处理搜索指令失败：{e}")
                 return {"ok": False, "msg": f"处理失败：{e}"}
             return {"ok": bool(res.get("success", True)),
                     "msg": res.get("message") or f"已开始搜索：{keyword}"}
@@ -1019,9 +1020,9 @@ class TaskConfirmMax(_PluginBase):
 
     plugin_name = "任务确认中心 Max"
     plugin_desc = ("一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），"
-                   "指令框只保留「mp 搜索词」；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
+                   "指令框直接输入搜索词；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.1.0"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmmax_"
@@ -1142,7 +1143,7 @@ class TaskConfirmMax(_PluginBase):
                 "endpoint": self.api_search,
                 "methods": ["POST"],
                 "auth": "apikey",
-                "summary": "发起 MP 媒体搜索并创建确认任务（等价于 H5 里发 mp 指令）",
+                "summary": "发起 MP 媒体搜索并创建确认任务（等价于 H5 指令框直接输入搜索词）",
             },
             {
                 "path": "/status",
@@ -1185,7 +1186,7 @@ class TaskConfirmMax(_PluginBase):
         self._srv = None
 
     def _web_command(self, keyword: str) -> Dict[str, Any]:
-        """H5 指令框发来的 `mp <搜索词>`：后台线程执行搜索，立即返回。"""
+        """H5 指令框发来的搜索词：后台线程执行搜索，立即返回。"""
         with self._lock:
             for job in self._jobs.values():
                 if job.get("keyword") == keyword and job.get("state") == "pending":
@@ -1831,7 +1832,7 @@ class TaskConfirmMax(_PluginBase):
                     "variant": "tonal",
                     "text": (
                         head +
-                        "用法：打开页面指令框输入「mp 搜索词」→ 选择媒体（阶段 1）→ "
+                        "用法：打开页面指令框直接输入搜索词 → 选择媒体（阶段 1）→ "
                         "选择站点资源（阶段 2）→ 自动/指定下载器下载（阶段 3）。\n\n最近记录：\n" + lines
                     ),
                 },
