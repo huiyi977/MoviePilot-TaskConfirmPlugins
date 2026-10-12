@@ -7,10 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Request
 
+from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
 from app.sdk.plugin import _PluginBase
+from app.sdk.services import ServiceConfigHelper
 from app.schemas.types import MediaSource, MediaType, NotificationType
 from app.sdk.logging import logger
 from app.utils.http import RequestUtils
@@ -21,13 +23,13 @@ class TaskConfirmBridge(_PluginBase):
     任务确认中心桥接：确认中心发起「mp 搜索词」→ 本插件搜索媒体 →
     候选列表作为确认任务推回中心 → 用户在中心 H5 选择媒体（阶段 1）→
     按 media_source/media_id 搜索站点资源，编号展示标题/大小/站点/做种数（阶段 2）→
-    等待用户选择要下载的资源（阶段 3 下载另接）。
+    选定资源后自动用 MP 默认下载器下载（阶段 3，可关闭改为推送下载器选择卡片）。
     """
 
     plugin_name = "任务确认桥接"
-    plugin_desc = "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，二次选择要下载的资源。"
+    plugin_desc = "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，二次选定后自动调用默认下载器下载。"
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmbridge.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmbridge_"
@@ -44,6 +46,7 @@ class TaskConfirmBridge(_PluginBase):
     _send_center_notify = True
     _result_notify = True
     _torrent_mode = True
+    _auto_downloader = True
 
     def __init__(self):
         super().__init__()
@@ -76,6 +79,7 @@ class TaskConfirmBridge(_PluginBase):
         self._send_center_notify = bool(config.get("send_center_notify", True))
         self._result_notify = bool(config.get("result_notify", True))
         self._torrent_mode = bool(config.get("torrent_mode", True))
+        self._auto_downloader = bool(config.get("auto_downloader", True))
         self._stopping = False
         if self._enabled and config.get("onlyonce"):
             logger.info("TaskConfirmBridge onlyonce 触发测试搜索：西游记")
@@ -375,7 +379,7 @@ class TaskConfirmBridge(_PluginBase):
                 "text": self._torrent_text(idx, ti),
                 "desc": self._torrent_desc(ti),
             })
-            torrent_map[key] = ti
+            torrent_map[key] = ctx
         if not options:
             job["state"] = "no_torrents"
             self._append_history(job, "资源搜索结果均为空种子信息")
@@ -412,7 +416,7 @@ class TaskConfirmBridge(_PluginBase):
             f"TaskConfirmBridge 已创建资源选择任务 {task_id2}（{len(options)} 个资源，按做种数排序截取）"
         )
 
-        # 等待用户选择资源（阶段 3 下载接入前：选定即停）
+        # 等待用户选择资源 → 进入阶段 3（下载）
         final = self._poll_final(task_id2)
         with self._lock:
             job2 = self._jobs.get(task_id2, job2)
@@ -423,23 +427,158 @@ class TaskConfirmBridge(_PluginBase):
             return
         option_key = str(final.get("option") or "")
         torrent_text = str(final.get("option_text") or "")
-        ti = torrent_map.get(option_key)
+        ctx = torrent_map.get(option_key)
         job2["state"] = "picked"
         job2["selected"] = torrent_text
-        if ti is None:
+        if ctx is None:
             self._append_history(job2, "选中的资源不在本进程缓存中（可能重启过）")
             return
-        # 阶段 3 下载待接入：此处仅记录并停止执行
-        logger.info(
-            f"TaskConfirmBridge 阶段 2 完成：{torrent_text}（{getattr(ti, 'site_name', '')}）"
-        )
-        self._append_history(job2, "已选定资源，等待阶段 3 下载接入")
-        self._notify_result(
-            f"✅ 已选择资源（阶段 3 下载待接入）：{m_title}",
-            f"{torrent_text}\n站点：{getattr(ti, 'site_name', '') or '未知'}"
-            f"\n大小：{self._fmt_size(getattr(ti, 'size', 0))}"
-            f"\n任务：{task_id2}",
-        )
+        logger.info(f"TaskConfirmBridge 阶段 2 完成，用户选定资源：{torrent_text}")
+        self._append_history(job2, "用户已选定资源，进入阶段 3 下载")
+        self._run_download_stage(job2, ctx, torrent_text)
+
+    # ------------------------------------------------------------------ 阶段 3：下载
+    def _list_downloaders(self) -> List[Dict[str, Any]]:
+        """列出 MP 中已启用的下载器（含默认标记）。"""
+        items: List[Dict[str, Any]] = []
+        try:
+            for conf in (ServiceConfigHelper.get_downloader_configs() or []):
+                if not getattr(conf, "enabled", False):
+                    continue
+                name = str(getattr(conf, "name", "") or "").strip()
+                if not name:
+                    continue
+                items.append({
+                    "name": name,
+                    "type": str(getattr(conf, "type", "") or ""),
+                    "default": bool(getattr(conf, "default", False)),
+                })
+        except Exception as e:
+            logger.warn(f"TaskConfirmBridge 读取下载器配置失败：{e}")
+        return items
+
+    def _default_downloader_name(self) -> str:
+        """MP 默认下载器名称（default=True 优先，否则第一个已启用）。"""
+        items = self._list_downloaders()
+        for it in items:
+            if it.get("default"):
+                return it["name"]
+        return items[0]["name"] if items else ""
+
+    def _run_download_stage(self, job: Dict[str, Any], ctx, torrent_text: str):
+        """阶段 3：自动用默认下载器下载；关闭自动则先让用户选下载器。"""
+        if self._auto_downloader:
+            name = self._default_downloader_name()
+            logger.info(
+                f"TaskConfirmBridge 阶段 3 自动下载（默认下载器：{name or '由 MP 决定'}）：{torrent_text}"
+            )
+            self._do_download(job, ctx, torrent_text, None)
+            return
+
+        items = self._list_downloaders()
+        if not items:
+            self._append_history(job, "未找到已启用的下载器，回退默认下载器")
+            self._notify_result(
+                "⚠️ 未找到已启用的下载器，改用默认下载器",
+                f"资源：{torrent_text}",
+            )
+            self._do_download(job, ctx, torrent_text, None)
+            return
+
+        options: List[Dict[str, Any]] = []
+        name_map: Dict[str, str] = {}
+        for i, it in enumerate(items, start=1):
+            key = f"d{i}"
+            tag = "（默认）" if it.get("default") else ""
+            options.append({
+                "key": key,
+                "text": f"{i}. {it['name']}{tag}｜{it.get('type') or '未知类型'}",
+                "desc": f"下载器：{it['name']}（{it.get('type') or '未知类型'}）{tag}",
+            })
+            name_map[key] = it["name"]
+
+        payload = {
+            "title": f"下载器选择：{torrent_text.split('｜')[0][:28]}",
+            "sub_title": "TaskConfirmBridge · 阶段 3/3 · 请选择下载器",
+            "style": "text",
+            "options": options,
+            "timeout": self._task_timeout,
+            "notify": self._send_center_notify,
+        }
+        task_id3 = self._create_center_task(payload)
+        if not task_id3:
+            self._append_history(job, "确认中心创建下载器选择任务失败，回退默认下载器")
+            self._do_download(job, ctx, torrent_text, None)
+            return
+
+        job3 = {
+            "task_id": task_id3,
+            "keyword": job.get("keyword"),
+            "state": "pending",
+            "stage": 3,
+            "created_at": time.time(),
+            "count": len(options),
+            "selected": torrent_text[:64],
+        }
+        with self._lock:
+            self._jobs[task_id3] = job3
+        logger.info(f"TaskConfirmBridge 已创建下载器选择任务 {task_id3}（{len(options)} 个下载器）")
+
+        final = self._poll_final(task_id3)
+        with self._lock:
+            job3 = self._jobs.get(task_id3, job3)
+        if not final or final.get("state") != "done":
+            job3["state"] = "expired" if (final or {}).get("state") == "expired" else "timeout"
+            self._append_history(job3, "用户未选择下载器或超时")
+            self._notify_result(f"⌛ 下载器选择超时：{torrent_text[:40]}", f"任务 {task_id3}")
+            return
+        picked_name = name_map.get(str(final.get("option") or ""))
+        if not picked_name:
+            job3["state"] = "error"
+            self._append_history(job3, "选中的下载器不在本进程缓存中")
+            return
+        job3["state"] = "picked"
+        job3["selected"] = picked_name
+        self._append_history(job3, f"用户已选定下载器：{picked_name}")
+        self._do_download(job3, ctx, torrent_text, picked_name)
+
+    def _do_download(self, job: Dict[str, Any], ctx, torrent_text: str, downloader: Optional[str]):
+        """调用 MP 下载链把选中的资源加入下载器。"""
+        try:
+            did = DownloadChain().download_single(
+                context=ctx,
+                downloader=downloader or None,
+                source="TaskConfirmBridge",
+            )
+        except Exception as e:
+            logger.error(f"TaskConfirmBridge 添加下载异常：{e}")
+            job["state"] = "download_failed"
+            self._append_history(job, f"添加下载异常：{e}")
+            self._notify_result(f"❌ 添加下载失败：{torrent_text[:40]}", f"{e}")
+            return
+        used = downloader or self._default_downloader_name() or "默认下载器"
+        ti = getattr(ctx, "torrent_info", None)
+        if did:
+            job["state"] = "downloaded"
+            job["download_id"] = str(did)
+            self._append_history(job, f"已添加下载（{used}）hash={did}")
+            logger.info(f"TaskConfirmBridge 已添加下载：{used} hash={did}｜{torrent_text}")
+            self._notify_result(
+                f"⬇️ 已开始下载（{used}）：{self._torrent_short_title(ti)}",
+                f"{torrent_text}\n下载器：{used}\n任务：{job.get('task_id')}",
+            )
+        else:
+            job["state"] = "download_failed"
+            self._append_history(job, f"添加下载失败（{used}）")
+            self._notify_result(
+                f"❌ 添加下载失败（{used}）：{self._torrent_short_title(ti)}",
+                f"{torrent_text}\n任务：{job.get('task_id')}",
+            )
+
+    @staticmethod
+    def _torrent_short_title(ti) -> str:
+        title = str(getattr(ti, "title", "") or "未知资源")
+        return title[:40]
 
     # ------------------------------------------------------------------ 工具
     @staticmethod
@@ -672,6 +811,16 @@ class TaskConfirmBridge(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VSwitch",
+                                        "props": {"model": "auto_downloader", "label": "阶段 3 自动调用默认下载器（关闭则推送下载器选择卡片）"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
                                         "props": {"model": "result_notify", "label": "结果经 MP 通知播报"},
                                     }
                                 ],
@@ -692,6 +841,7 @@ class TaskConfirmBridge(_PluginBase):
             "send_center_notify": True,
             "result_notify": True,
             "torrent_mode": True,
+            "auto_downloader": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -712,7 +862,8 @@ class TaskConfirmBridge(_PluginBase):
                     "text": (
                         "用法：在任务确认中心指令框输入「mp 搜索词」→ 本插件搜索媒体 → "
                         "候选推回确认中心（阶段 1）→ 选择媒体后自动搜索站点资源并推送资源卡片 "
-                        "（阶段 2，含标题/大小/站点/做种数）→ 用户选定资源后停下等待下载接入（阶段 3）。\n\n最近记录：\n" + lines
+                        "（阶段 2，含标题/大小/站点/做种数）→ 选定资源后自动用默认下载器下载 "
+                        "（阶段 3，关闭自动开关则先推送下载器选择卡片）。\n\n最近记录：\n" + lines
                     ),
                 },
             }
