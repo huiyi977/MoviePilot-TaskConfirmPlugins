@@ -24,9 +24,12 @@ https://github.com/huiyi977/MoviePilot-TaskConfirmPlugins
 1. **端口映射**：插件在 **MP 容器内** 监听 8005，需要在 MP 容器上追加端口映射：
    `8005:8005`（主机端口可自定，若与宿主机已有 8005 冲突就映射成 `8006:8005`，
    并把插件的「对外访问地址」配成 `http://<主机IP>:8006`）。
-2. **通知**：默认调用通知中心脚本 `/app/sh/bark-we-go.sh`（规范 1.4）。
-   若 MP 容器里没有该脚本，可把 `notify_script` 指到任意可读路径，
-   或在「兜底 webhook」里填一个企微机器人地址（脚本缺失时自动用 Python 直推）。
+2. **通知**：v2.2.0 起内置直推，不再依赖任何外部脚本。插件配置里按渠道填：
+   - Bark：服务器（默认 `https://api.day.app`）+ DeviceKey
+   - 企业微信机器人：完整 Webhook URL
+   - Gotify：地址 + Token
+   通知渠道 `wecom` / `bark` / `gotify` / `all`（all 三渠道全发）；
+   凭证只存在插件配置里，代码不含任何个人信息。
 3. **页面访问**：`http://<主机IP>:<映射端口>/ui/pending`；若配置了 `api_token`，
    页面链接需带 `?token=<api_token>`（通知里的链接会自动带上）。
 

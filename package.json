@@ -20,12 +20,13 @@
     "name": "任务确认中心 Max",
     "description": "一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），指令框直接输入搜索词；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。",
     "labels": "媒体,订阅,任务确认,资源搜索,下载,内置服务",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "icon": "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png",
     "author": "huiyi977",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v2.2.0": "通知内置化：不再依赖 bark-we-go.sh 等外部脚本，插件内直接推送 bark / 企业微信机器人 / gotify（channel=all 全发）；配置界面直接填各渠道 Key/Token/Webhook，旧「兜底 webhook」自动迁移为企微 Webhook。",
       "v2.1.0": "指令框去掉 mp 前缀：直接输入搜索词即可搜索（旧的 `mp 搜索词` 写法仍兼容），帮助与提示同步更新。",
       "v2.0.1": "修复改配置重载时内嵌服务撞 EADDRINUSE：停止时等待旧线程真正退出（套接字释放），启动时绑定失败自动重试。",
       "v2.0.0": "Max 一体化版：把确认中心 Web 服务内嵌进插件（容器内默认 0.0.0.0:8005），不再依赖外部确认中心；去掉海报 2:3 截图与视频截图多选，指令框只保留「mp 搜索词」；通知沿用通知中心脚本（可配路径+极简模式）并内置 webhook 兜底；确认卡片/资源卡片/下载器卡片三阶段闭环，支持撤回与历史记录。"

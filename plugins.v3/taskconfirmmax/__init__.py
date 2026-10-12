@@ -12,7 +12,8 @@
   · 去掉「电影海报 2:3 截图（crop）」与「视频截图多选（frame）」两条业务线
   · 去掉图床上传 / 图片代理 / 设备切换，指令框只接收搜索词（无需前缀）
   · 去掉了与外部确认中心之间的 HTTP 往返：任务在进程内直接创建与等待
-  · 通知沿用通知中心脚本（bark-we-go.sh，规范 1.4），并内置 Python 兜底
+  · 通知**内置直推**：bark / wecom（企微机器人）/ gotify，界面上直接填各渠道 Key 即可，
+    不再依赖 bark-we-go.sh 等外部脚本（凭证只存在插件配置里，不写死在代码中）
 """
 
 from __future__ import annotations
@@ -21,12 +22,9 @@ import asyncio
 import hashlib
 import html
 import json
-import os
-import subprocess
 import threading
 import time
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import uvicorn
@@ -52,6 +50,8 @@ MAX_BUTTONS = 8          # card 模式选项上限
 MAX_OPTIONS_TEXT = 100   # text 模式选项上限
 
 DEFAULT_MINIMAL_TEXT = "【待处理确认】\\n{time} 你有一条待处理确认任务"
+
+DEFAULT_BARK_SERVER = "https://api.day.app"
 
 HELP_TEXT = """⚡ 任务确认中心 Max - 指令帮助
 
@@ -1022,7 +1022,7 @@ class TaskConfirmMax(_PluginBase):
     plugin_desc = ("一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），"
                    "指令框直接输入搜索词；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmmax_"
@@ -1043,14 +1043,17 @@ class TaskConfirmMax(_PluginBase):
     _torrent_mode = True
     _auto_downloader = True
     _notify_enabled = True
-    _notify_script = "/app/sh/bark-we-go.sh"
     _notify_channel = "wecom"
     _notify_pic = ""
     _notify_timeout = 15
     _notify_minimal = True
     _notify_minimal_text = DEFAULT_MINIMAL_TEXT
     _notify_minimal_pic = False
-    _notify_webhook = ""
+    _bark_server = DEFAULT_BARK_SERVER
+    _bark_key = ""
+    _wecom_webhook = ""
+    _gotify_url = ""
+    _gotify_token = ""
 
     def __init__(self):
         super().__init__()
@@ -1095,7 +1098,6 @@ class TaskConfirmMax(_PluginBase):
         self._torrent_mode = bool(config.get("torrent_mode", True))
         self._auto_downloader = bool(config.get("auto_downloader", True))
         self._notify_enabled = bool(config.get("notify_enabled", True))
-        self._notify_script = str(config.get("notify_script") or "/app/sh/bark-we-go.sh").strip()
         self._notify_channel = (str(config.get("notify_channel") or "wecom").strip().lower() or "wecom")
         self._notify_pic = str(config.get("notify_pic") or "").strip()
         try:
@@ -1106,7 +1108,14 @@ class TaskConfirmMax(_PluginBase):
         self._notify_minimal_text = (str(config.get("notify_minimal_text") or "").replace("\\n", "\n").strip()
                                      or DEFAULT_MINIMAL_TEXT)
         self._notify_minimal_pic = bool(config.get("notify_minimal_pic", False))
-        self._notify_webhook = str(config.get("notify_webhook") or "").strip()
+        self._bark_server = (str(config.get("bark_server") or "").strip() or DEFAULT_BARK_SERVER)
+        self._bark_key = str(config.get("bark_key") or "").strip()
+        self._wecom_webhook = str(config.get("wecom_webhook") or "").strip()
+        self._gotify_url = str(config.get("gotify_url") or "").strip()
+        self._gotify_token = str(config.get("gotify_token") or "").strip()
+        # v2.1.x 旧配置迁移：兜底 webhook（企微）→ wecom_webhook
+        if not self._wecom_webhook:
+            self._wecom_webhook = str(config.get("notify_webhook") or "").strip()
 
         # 载入历史记录
         try:
@@ -1589,7 +1598,7 @@ class TaskConfirmMax(_PluginBase):
         return tpl.strip()
 
     def _notify_card(self, task: _Task) -> None:
-        """确认卡片推送（走通知中心脚本，极简模式可用）。非阻塞：另起线程发送。"""
+        """确认卡片推送（内置直推 bark/wecom/gotify，极简模式可用）。非阻塞：另起线程发送。"""
         if not self._notify_enabled:
             logger.info("TaskConfirmMax 通知总开关关闭，跳过任务通知 %s", task.task_id)
             return
@@ -1612,34 +1621,73 @@ class TaskConfirmMax(_PluginBase):
         threading.Thread(target=self._send_notify, args=(text, pic), daemon=True).start()
 
     def _send_notify(self, text: str, pic: str = ""):
-        """优先调用通知中心脚本（bark-we-go.sh 规范 1.4）；脚本缺失时回落内置 webhook。"""
-        script = Path(self._notify_script) if self._notify_script else None
-        if script is not None and script.is_file():
-            env = dict(os.environ)
-            env["NOTIFY_CALLER"] = "taskconfirmmax"
-            env.setdefault("LOG_FILE", "/tmp/taskconfirmmax-notify.log")
+        """内置通知直推（移植 bark-we-go.sh v1.4 逻辑，无脚本依赖）。
+
+        约定与脚本一致：正文第一行视为标题；单条消息截断到 1800 字符；
+        图片 URL 仅 bark 渠道生效；channel=all 时三渠道全发。
+        """
+        import httpx  # MP 运行时自带
+
+        text = (text or "").strip()
+        if len(text) > 1800:
+            text = text[:1797] + "..."
+        first, _, rest = text.partition("\n")
+        title = first.strip() or "通知"
+        body = rest.strip() or first.strip()
+
+        channel = (self._notify_channel or "wecom").strip().lower()
+        channels = ["bark", "wecom", "gotify"] if channel == "all" else [channel]
+        sent: List[str] = []
+        failed: List[str] = []
+        for ch in channels:
             try:
-                proc = subprocess.run(["bash", str(script), self._notify_channel, text, pic],
-                                      capture_output=True, timeout=self._notify_timeout, env=env)
-                err = (proc.stderr or b"").decode("utf-8", "ignore").strip()
-                if proc.returncode == 0:
-                    logger.info(f"TaskConfirmMax 通知已发送（{self._notify_channel}）：{err[:120]}")
+                if ch == "bark":
+                    self._push_bark(httpx, title, body, pic)
+                elif ch == "wecom":
+                    self._push_wecom(httpx, text)
+                elif ch == "gotify":
+                    self._push_gotify(httpx, title, body)
                 else:
-                    logger.warn(f"TaskConfirmMax 通知失败（退出码 {proc.returncode}）：{err[:160]}")
-                return
+                    failed.append(f"{ch}:未知渠道")
+                    continue
+                sent.append(ch)
             except Exception as e:  # noqa: BLE001
-                logger.warn(f"TaskConfirmMax 通知脚本执行异常：{e}")
-        if self._notify_webhook:
-            try:
-                import httpx  # MP 运行时自带
-                payload = {"msgtype": "text", "text": {"content": text[:2000]}}
-                httpx.post(self._notify_webhook, json=payload, timeout=8)
-                logger.info("TaskConfirmMax 通知已发送（内置 webhook 兜底）")
-            except Exception as e:  # noqa: BLE001
-                logger.warn(f"TaskConfirmMax 兜底 webhook 通知失败：{e}")
-        else:
-            logger.warn(f"TaskConfirmMax 未找到通知脚本 {self._notify_script}，且未配置兜底 webhook，"
-                        f"本次通知未发送（{text.splitlines()[0] if text else ''}）")
+                failed.append(f"{ch}:{e}")
+        if sent:
+            logger.info(f"TaskConfirmMax 通知已发送（{'/'.join(sent)}）：{title[:60]}")
+        if failed:
+            logger.warn(f"TaskConfirmMax 通知失败：{'；'.join(failed)}")
+
+    def _push_bark(self, httpx, title: str, body: str, pic: str = ""):
+        if not self._bark_key:
+            raise RuntimeError("未配置 Bark DeviceKey")
+        server = (self._bark_server or DEFAULT_BARK_SERVER).rstrip("/")
+        payload: Dict[str, Any] = {"title": title, "body": body}
+        if pic:
+            payload["image"] = pic
+        r = httpx.post(f"{server}/{self._bark_key}", json=payload,
+                       timeout=self._notify_timeout)
+        r.raise_for_status()
+
+    def _push_wecom(self, httpx, text: str):
+        if not self._wecom_webhook:
+            raise RuntimeError("未配置企业微信机器人 Webhook")
+        r = httpx.post(self._wecom_webhook,
+                       json={"msgtype": "text", "text": {"content": text[:2000]}},
+                       timeout=self._notify_timeout)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+        if isinstance(data, dict) and data.get("errcode") not in (0, None):
+            raise RuntimeError(f"企微 errcode={data.get('errcode')} {data.get('errmsg') or ''}")
+
+    def _push_gotify(self, httpx, title: str, body: str):
+        if not self._gotify_url or not self._gotify_token:
+            raise RuntimeError("未配置 Gotify 地址/Token")
+        url = f"{self._gotify_url.rstrip('/')}/message"
+        r = httpx.post(url, params={"token": self._gotify_token},
+                       json={"title": title, "message": body},
+                       timeout=self._notify_timeout)
+        r.raise_for_status()
 
     def _notify_result(self, title: str, text: str):
         """结果播报经 MP 原生通知。"""
@@ -1774,10 +1822,17 @@ class TaskConfirmMax(_PluginBase):
                             {"component": "VDivider", "props": {"class": "my-2"}}]},
                         switch("notify_enabled", "启用确认卡片通知"),
                         col("notify_channel", "通知渠道（bark/wecom/gotify/all）", 3, "wecom"),
-                        col("notify_script", "通知脚本路径", 9, "/app/sh/bark-we-go.sh"),
+                        col("notify_timeout", "通知超时（秒）", 3, "15"),
                         col("notify_pic", "通知图片 URL（仅 bark 生效）", 6),
-                        col("notify_webhook", "兜底 webhook（企微机器人，脚本缺失时用）", 6),
-                        col("notify_timeout", "通知脚本超时（秒）", 3),
+                        {"component": "VCol", "props": {"cols": 12, "md": 12}, "content": [
+                            {"component": "VDivider", "props": {"class": "my-2"}}]},
+                        col("bark_server", "Bark 服务器", 4, "https://api.day.app"),
+                        col("bark_key", "Bark DeviceKey", 8),
+                        col("wecom_webhook", "企业微信机器人 Webhook（完整 URL）", 12),
+                        col("gotify_url", "Gotify 地址", 6, "http://192.168.5.70:18100"),
+                        col("gotify_token", "Gotify Token", 6),
+                        {"component": "VCol", "props": {"cols": 12, "md": 12}, "content": [
+                            {"component": "VDivider", "props": {"class": "my-2"}}]},
                         switch("notify_minimal", "极简模式（只发时间+一行提示）"),
                         switch("notify_minimal_pic", "极简模式仍附图片"),
                         col("notify_minimal_text", "极简正文模板（{time}{kind}{title}{url}）", 12),
@@ -1801,10 +1856,13 @@ class TaskConfirmMax(_PluginBase):
             "result_notify": True,
             "notify_enabled": True,
             "notify_channel": "wecom",
-            "notify_script": "/app/sh/bark-we-go.sh",
             "notify_pic": "",
-            "notify_webhook": "",
             "notify_timeout": 15,
+            "bark_server": DEFAULT_BARK_SERVER,
+            "bark_key": "",
+            "wecom_webhook": "",
+            "gotify_url": "",
+            "gotify_token": "",
             "notify_minimal": True,
             "notify_minimal_pic": False,
             "notify_minimal_text": DEFAULT_MINIMAL_TEXT,
