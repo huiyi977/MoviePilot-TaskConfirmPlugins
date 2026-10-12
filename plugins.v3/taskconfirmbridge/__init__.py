@@ -46,6 +46,7 @@ class TaskConfirmBridge(_PluginBase):
     _torrent_mode = True
 
     def __init__(self):
+        super().__init__()
         self._lock = threading.Lock()
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._history: List[Dict[str, Any]] = []
