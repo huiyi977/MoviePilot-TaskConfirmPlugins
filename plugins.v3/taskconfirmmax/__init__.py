@@ -959,11 +959,22 @@ class _ConfirmServer:
     def start(self):
         if self._thread is not None and self._thread.is_alive():
             return
-        cfg = uvicorn.Config(self.app, host=self.host, port=self.port,
-                             log_level="warning", access_log=False)
-        self._uv = uvicorn.Server(cfg)
-        self._thread = threading.Thread(target=self._uv.run, name="taskconfirmmax-web", daemon=True)
-        self._thread.start()
+        # 端口可能刚被上一个实例释放（TIME_WAIT/优雅停机中），重试几次绑定
+        for attempt in range(1, 4):
+            cfg = uvicorn.Config(self.app, host=self.host, port=self.port,
+                                 log_level="warning", access_log=False)
+            self._uv = uvicorn.Server(cfg)
+            self._thread = threading.Thread(target=self._uv.run,
+                                            name=f"taskconfirmmax-web-{attempt}", daemon=True)
+            self._thread.start()
+            time.sleep(1.2)
+            if self._thread.is_alive():
+                break
+            logger.warn(f"TaskConfirmMax 端口 {self.port} 绑定失败（第 {attempt} 次），重试")
+            time.sleep(1.0)
+        else:
+            logger.error(f"TaskConfirmMax 内嵌确认中心启动失败：端口 {self.port} 一直无法绑定")
+            return
         self._reaper_stop.clear()
         self._reaper = threading.Thread(target=self._reap_loop, name="taskconfirmmax-reaper", daemon=True)
         self._reaper.start()
@@ -978,11 +989,20 @@ class _ConfirmServer:
 
     def stop(self):
         self._reaper_stop.set()
+        uv_server, thread = self._uv, self._thread
         try:
-            if self._uv is not None:
-                self._uv.should_exit = True
+            if uv_server is not None:
+                uv_server.should_exit = True
         except Exception:
             pass
+        # 必须等旧线程真正退出（套接字已关闭），否则改配置重载时会撞 EADDRINUSE
+        try:
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=15)
+        except Exception:
+            pass
+        self._uv = None
+        self._thread = None
         logger.info("TaskConfirmMax 内嵌确认中心已停止")
 
 
@@ -1001,7 +1021,7 @@ class TaskConfirmMax(_PluginBase):
     plugin_desc = ("一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），"
                    "指令框只保留「mp 搜索词」；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmmax_"
