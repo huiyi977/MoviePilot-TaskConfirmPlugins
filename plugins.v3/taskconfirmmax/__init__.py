@@ -14,6 +14,8 @@
   · 去掉了与外部确认中心之间的 HTTP 往返：任务在进程内直接创建与等待
   · 通知**内置直推**：bark / wecom（企微机器人）/ gotify，界面上直接填各渠道 Key 即可，
     不再依赖 bark-we-go.sh 等外部脚本（凭证只存在插件配置里，不写死在代码中）
+  · 阶段 1 选中媒体后先查媒体库（Emby/Jellyfin/Plex…）：已存在则通知并终止，不再搜资源/下载
+    （开关 `check_library`，默认开启）
 """
 
 from __future__ import annotations
@@ -1022,7 +1024,7 @@ class TaskConfirmMax(_PluginBase):
     plugin_desc = ("一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），"
                    "指令框直接输入搜索词；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png"
-    plugin_version = "2.2.0"
+    plugin_version = "2.3.0"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmmax_"
@@ -1042,6 +1044,7 @@ class TaskConfirmMax(_PluginBase):
     _result_notify = True
     _torrent_mode = True
     _auto_downloader = True
+    _check_library = True
     _notify_enabled = True
     _notify_channel = "wecom"
     _notify_pic = ""
@@ -1097,6 +1100,7 @@ class TaskConfirmMax(_PluginBase):
         self._result_notify = bool(config.get("result_notify", True))
         self._torrent_mode = bool(config.get("torrent_mode", True))
         self._auto_downloader = bool(config.get("auto_downloader", True))
+        self._check_library = bool(config.get("check_library", True))
         self._notify_enabled = bool(config.get("notify_enabled", True))
         self._notify_channel = (str(config.get("notify_channel") or "wecom").strip().lower() or "wecom")
         self._notify_pic = str(config.get("notify_pic") or "").strip()
@@ -1334,6 +1338,16 @@ class TaskConfirmMax(_PluginBase):
             self._append_history(job, "选中的候选不在本进程缓存中（可能重启过）")
             return
 
+        # 媒体库已存在检查（可在配置里关闭）：命中则通知 + 跳过后续全部阶段
+        if self._check_library:
+            exists_info = self._library_exists(media)
+            if exists_info:
+                job["state"] = "exists"
+                self._append_history(job, f"媒体库已存在（{exists_info.get('server') or '媒体服务器'}），已跳过")
+                logger.info(f"TaskConfirmMax 媒体库已存在，跳过阶段 2/3：{option_text}")
+                self._notify_library_exists(media, exists_info)
+                return
+
         if self._torrent_mode:
             self._run_torrent_stage(job, keyword, media, option_text)
             return
@@ -1363,6 +1377,53 @@ class TaskConfirmMax(_PluginBase):
         else:
             self._append_history(job, f"订阅失败：{err}")
             self._notify_result(f"❌ 订阅失败：{option_text}", f"任务 {task_id}\n{err or '未知原因'}")
+
+    # ------------------------------------------------------------------ 媒体库检查
+    def _library_exists(self, media) -> Optional[Dict[str, Any]]:
+        """查媒体服务器（Emby/Jellyfin/Plex/…）是否已有该媒体。
+
+        返回 None 表示媒体库没有（继续后续阶段）；否则返回 {server, text, seasons}。
+        查询异常一律按「不存在」处理，避免因为媒体服务器不可用卡住整条链路。
+        """
+        try:
+            from app.chain.mediaserver import MediaServerChain
+            info = MediaServerChain().media_exists(mediainfo=media)
+        except Exception as e:  # noqa: BLE001
+            logger.warn(f"TaskConfirmMax 媒体库查询失败（按不存在继续）：{e}")
+            return None
+        if not info:
+            return None
+        seasons = getattr(info, "seasons", None) or {}
+        parts: List[str] = []
+        for sn in sorted(seasons.keys(), key=lambda x: str(x)):
+            eps = seasons.get(sn) or []
+            try:
+                label = f"S{int(sn):02d}"
+            except Exception:
+                label = f"S{sn}"
+            parts.append(f"{label}：{len(eps)} 集" if eps else f"{label}：已有")
+        server = (getattr(info, "server", None) or getattr(info, "server_type", None) or "")
+        return {"server": str(server), "seasons": parts, "text": "、".join(parts)}
+
+    def _notify_library_exists(self, media, info: Dict[str, Any]) -> None:
+        """媒体库已存在 → 发一条通知（走插件内置通知渠道），随后终止本次任务。"""
+        title = str(getattr(media, "title", "") or "未知媒体")
+        year = getattr(media, "year", None) or "未知年份"
+        first = f"ℹ️ 媒体库已存在：{title}"
+        lines = [first, f"媒体：{title}（{year}）"]
+        if info.get("server"):
+            lines.append(f"媒体服务器：{info['server']}")
+        if info.get("text"):
+            lines.append(f"已入库：{info['text']}")
+        lines.append("已跳过资源搜索与下载，本次任务结束。")
+        text = "\n".join(lines)
+        if self._notify_enabled:
+            try:
+                self._send_notify(text)
+            except Exception as e:  # noqa: BLE001
+                logger.warn(f"TaskConfirmMax 媒体库已存在通知发送失败：{e}")
+        else:
+            logger.info("TaskConfirmMax 通知总开关关闭，媒体库已存在提示未推送")
 
     # ------------------------------------------------------------------ 阶段 2：资源搜索
     def _run_torrent_stage(self, job: Dict[str, Any], keyword: str, media, media_text: str):
@@ -1817,6 +1878,7 @@ class TaskConfirmMax(_PluginBase):
                         switch("send_center_notify", "任务推送时发通知"),
                         switch("torrent_mode", "选媒体后搜索资源（关闭则直接订阅）"),
                         switch("auto_downloader", "阶段 3 自动调用默认下载器（关闭则推送下载器选择卡）"),
+                        switch("check_library", "检查媒体库已存在（存在则通知并终止）"),
                         switch("result_notify", "结果经 MP 通知播报"),
                         {"component": "VCol", "props": {"cols": 12, "md": 12}, "content": [
                             {"component": "VDivider", "props": {"class": "my-2"}}]},
@@ -1853,6 +1915,7 @@ class TaskConfirmMax(_PluginBase):
             "send_center_notify": True,
             "torrent_mode": True,
             "auto_downloader": True,
+            "check_library": True,
             "result_notify": True,
             "notify_enabled": True,
             "notify_channel": "wecom",
