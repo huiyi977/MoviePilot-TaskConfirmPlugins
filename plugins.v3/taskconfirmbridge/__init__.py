@@ -8,9 +8,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import Request
 
 from app.chain.media import MediaChain
+from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
 from app.sdk.plugin import _PluginBase
-from app.schemas.types import MediaType, NotificationType
+from app.schemas.types import MediaSource, MediaType, NotificationType
 from app.sdk.logging import logger
 from app.utils.http import RequestUtils
 
@@ -18,13 +19,15 @@ from app.utils.http import RequestUtils
 class TaskConfirmBridge(_PluginBase):
     """
     任务确认中心桥接：确认中心发起「mp 搜索词」→ 本插件搜索媒体 →
-    候选列表作为确认任务推回中心 → 用户在中心 H5 选择 → 本插件收割结果并添加订阅。
+    候选列表作为确认任务推回中心 → 用户在中心 H5 选择媒体（阶段 1）→
+    按 media_source/media_id 搜索站点资源，编号展示标题/大小/站点/做种数（阶段 2）→
+    等待用户选择要下载的资源（阶段 3 下载另接）。
     """
 
     plugin_name = "任务确认桥接"
-    plugin_desc = "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后自动添加订阅。"
+    plugin_desc = "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，二次选择要下载的资源。"
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmbridge.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmbridge_"
@@ -40,6 +43,7 @@ class TaskConfirmBridge(_PluginBase):
     _poll_interval = 5
     _send_center_notify = True
     _result_notify = True
+    _torrent_mode = True
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -70,6 +74,7 @@ class TaskConfirmBridge(_PluginBase):
             self._poll_interval = 5
         self._send_center_notify = bool(config.get("send_center_notify", True))
         self._result_notify = bool(config.get("result_notify", True))
+        self._torrent_mode = bool(config.get("torrent_mode", True))
         self._stopping = False
         if self._enabled and config.get("onlyonce"):
             logger.info("TaskConfirmBridge onlyonce 触发测试搜索：西游记")
@@ -201,6 +206,7 @@ class TaskConfirmBridge(_PluginBase):
             "task_id": task_id,
             "keyword": keyword,
             "state": "pending",
+            "stage": 1,
             "created_at": time.time(),
             "count": len(options),
         }
@@ -217,18 +223,17 @@ class TaskConfirmBridge(_PluginBase):
             "count": len(options),
         }
 
-    def _wait_and_subscribe(self, task_id: str, keyword: str, key_map: Dict[str, Any]):
-        """后台线程：长轮询中心任务状态，确认后添加订阅。"""
+    def _poll_final(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """后台长轮询中心任务直至结束，返回最终 status 数据（None=未取到有效结果）。"""
         base = self._center_url
         params: Dict[str, Any] = {"wait": 25}
         if self._center_token:
             params["token"] = self._center_token
         deadline = time.time() + self._wait_total
-        final: Optional[Dict[str, Any]] = None
         time.sleep(2)
         while time.time() < deadline:
             if self._stopping:
-                return
+                return None
             try:
                 resp = RequestUtils().get_res(f"{base}/api/v1/task/status/{task_id}", params=params)
                 data = resp.json() if resp is not None else {}
@@ -237,12 +242,13 @@ class TaskConfirmBridge(_PluginBase):
                 logger.warn(f"TaskConfirmBridge 轮询任务 {task_id} 异常：{e}")
                 time.sleep(self._poll_interval)
                 continue
-            if state == "done":
-                final = data
-                break
-            if state in ("expired", "unknown"):
-                final = data
-                break
+            if state in ("done", "expired", "unknown"):
+                return data
+        return None
+
+    def _wait_and_subscribe(self, task_id: str, keyword: str, key_map: Dict[str, Any]):
+        """后台线程：长轮询阶段 1 卡片，用户选中媒体后进入阶段 2（或直接订阅）。"""
+        final = self._poll_final(task_id)
         with self._lock:
             job = self._jobs.get(task_id)
         if job is None:
@@ -259,6 +265,10 @@ class TaskConfirmBridge(_PluginBase):
         job["selected"] = option_text
         if media is None:
             self._append_history(job, "选中的候选不在本进程缓存中（可能重启过）")
+            return
+
+        if self._torrent_mode:
+            self._run_torrent_stage(job, keyword, media, option_text)
             return
 
         logger.info(f"TaskConfirmBridge 任务 {task_id} 用户已选：{option_text}，开始添加订阅")
@@ -289,7 +299,192 @@ class TaskConfirmBridge(_PluginBase):
             self._append_history(job, f"订阅失败：{err}")
             self._notify_result(f"❌ 订阅失败：{option_text}", f"任务 {task_id}\n{err or '未知原因'}")
 
+    # ------------------------------------------------------------------ 阶段 2：资源搜索
+    def _create_center_task(self, payload: Dict[str, Any]) -> Optional[str]:
+        """向确认中心创建任务，成功返回 task_id。"""
+        params = {}
+        if self._center_token:
+            params["token"] = self._center_token
+        resp = RequestUtils(headers={"Content-Type": "application/json"}).post_res(
+            f"{self._center_url}/api/v1/task/create", json=payload, params=params or None,
+        )
+        if resp is None or resp.status_code != 200:
+            logger.error(f"TaskConfirmBridge 确认中心创建任务失败（HTTP {getattr(resp, 'status_code', 'None')}）")
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            return None
+        task_id = str(data.get("task_id") or "")
+        return task_id or None
+
+    def _run_torrent_stage(self, job: Dict[str, Any], keyword: str, media, media_text: str):
+        """阶段 2：按 media_source/media_id 搜索资源 → 编号推卡片 → 等用户选择下载即停。"""
+        m_title = str(media.title or keyword)
+        m_source = str(getattr(media, "media_source", "") or "")
+        m_id = str(getattr(media, "media_id", "") or "")
+        logger.info(
+            f"TaskConfirmBridge 阶段 2 资源搜索：{media_text}（{m_source}:{m_id}）"
+        )
+        if not m_id:
+            job["state"] = "error"
+            self._append_history(job, "选中媒体缺少 media_id，无法搜索资源")
+            self._notify_result(f"❌ 无法搜索资源：{m_title}", f"选中媒体缺少 media_id\n{media_text}")
+            return
+        self._notify_result(
+            f"🔍 正在搜索资源：{m_title}",
+            f"{media_text}\n数据源：{m_source}:{m_id}\n搜索完成后将推送资源选择卡片",
+        )
+        try:
+            msource = media.media_source
+            try:
+                msource = MediaSource(msource)
+            except Exception:
+                pass
+            contexts = SearchChain().search_by_id(
+                media_source=msource,
+                media_id=m_id,
+                mtype=media.type,
+            ) or []
+        except Exception as e:
+            logger.error(f"TaskConfirmBridge 资源搜索异常：{e}")
+            job["state"] = "error"
+            self._append_history(job, f"资源搜索异常：{e}")
+            self._notify_result(f"❌ 资源搜索失败：{m_title}", f"任务 {job.get('task_id')}\n{e}")
+            return
+        if not contexts:
+            job["state"] = "no_torrents"
+            self._append_history(job, "资源搜索无结果")
+            self._notify_result(f"❌ 未搜索到资源：{m_title}", f"任务 {job.get('task_id')}")
+            return
+
+        contexts.sort(key=self._ctx_seeders, reverse=True)
+        contexts = contexts[: self._max_options]
+        options: List[Dict[str, Any]] = []
+        torrent_map: Dict[str, Any] = {}
+        idx = 0
+        for ctx in contexts:
+            ti = getattr(ctx, "torrent_info", None)
+            if ti is None:
+                continue
+            idx += 1
+            key = f"t{idx}"
+            options.append({
+                "key": key,
+                "text": self._torrent_text(idx, ti),
+                "desc": self._torrent_desc(ti),
+            })
+            torrent_map[key] = ti
+        if not options:
+            job["state"] = "no_torrents"
+            self._append_history(job, "资源搜索结果均为空种子信息")
+            self._notify_result(f"❌ 未搜索到有效资源：{m_title}", f"任务 {job.get('task_id')}")
+            return
+
+        payload = {
+            "title": f"资源选择：{m_title}（{media.year or '未知年份'}）"[:64],
+            "sub_title": "TaskConfirmBridge · 阶段 2/3 · 请选择要下载的资源",
+            "style": "text",
+            "options": options,
+            "timeout": self._task_timeout,
+            "notify": self._send_center_notify,
+        }
+        task_id2 = self._create_center_task(payload)
+        if not task_id2:
+            job["state"] = "error"
+            self._append_history(job, "确认中心创建资源选择任务失败")
+            self._notify_result(f"❌ 资源卡片推送失败：{m_title}", f"任务 {job.get('task_id')}")
+            return
+
+        job2 = {
+            "task_id": task_id2,
+            "keyword": keyword,
+            "state": "pending",
+            "stage": 2,
+            "created_at": time.time(),
+            "count": len(options),
+            "selected": f"{m_title}（{media.year or '未知年份'}）",
+        }
+        with self._lock:
+            self._jobs[task_id2] = job2
+        logger.info(
+            f"TaskConfirmBridge 已创建资源选择任务 {task_id2}（{len(options)} 个资源，按做种数排序截取）"
+        )
+
+        # 等待用户选择资源（阶段 3 下载接入前：选定即停）
+        final = self._poll_final(task_id2)
+        with self._lock:
+            job2 = self._jobs.get(task_id2, job2)
+        if not final or final.get("state") != "done":
+            job2["state"] = "expired" if (final or {}).get("state") == "expired" else "timeout"
+            self._append_history(job2, "用户未选择资源或超时")
+            self._notify_result(f"⌛ 资源选择超时：{m_title}", f"任务 {task_id2}")
+            return
+        option_key = str(final.get("option") or "")
+        torrent_text = str(final.get("option_text") or "")
+        ti = torrent_map.get(option_key)
+        job2["state"] = "picked"
+        job2["selected"] = torrent_text
+        if ti is None:
+            self._append_history(job2, "选中的资源不在本进程缓存中（可能重启过）")
+            return
+        # 阶段 3 下载待接入：此处仅记录并停止执行
+        logger.info(
+            f"TaskConfirmBridge 阶段 2 完成：{torrent_text}（{getattr(ti, 'site_name', '')}）"
+        )
+        self._append_history(job2, "已选定资源，等待阶段 3 下载接入")
+        self._notify_result(
+            f"✅ 已选择资源（阶段 3 下载待接入）：{m_title}",
+            f"{torrent_text}\n站点：{getattr(ti, 'site_name', '') or '未知'}"
+            f"\n大小：{self._fmt_size(getattr(ti, 'size', 0))}"
+            f"\n任务：{task_id2}",
+        )
+
     # ------------------------------------------------------------------ 工具
+    @staticmethod
+    def _ctx_seeders(ctx) -> int:
+        ti = getattr(ctx, "torrent_info", None)
+        try:
+            return int(getattr(ti, "seeders", 0) or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _fmt_size(num) -> str:
+        try:
+            n = float(num or 0)
+        except Exception:
+            return "未知"
+        if n >= 1024 ** 4:
+            return f"{n / 1024 ** 4:.2f} TB"
+        if n >= 1024 ** 3:
+            return f"{n / 1024 ** 3:.2f} GB"
+        if n >= 1024 ** 2:
+            return f"{n / 1024 ** 2:.1f} MB"
+        return f"{n / 1024:.0f} KB"
+
+    def _torrent_text(self, idx: int, ti) -> str:
+        """单行展示：标题｜大小｜站点｜做种数（卡片模板不渲染换行）。"""
+        title = str(getattr(ti, "title", "") or "未知标题")
+        free = "｜🆓免费" if getattr(ti, "downloadvolumefactor", None) == 0 else ""
+        text = (
+            f"{idx}. {title}"
+            f"｜{self._fmt_size(getattr(ti, 'size', 0))}"
+            f"｜{getattr(ti, 'site_name', '') or '未知站点'}"
+            f"｜⬆{getattr(ti, 'seeders', 0) or 0}{free}"
+        )
+        return text[:256]
+
+    def _torrent_desc(self, ti) -> str:
+        desc = str(getattr(ti, "description", "") or "").strip()
+        labels = getattr(ti, "labels", None) or []
+        pieces = []
+        if labels:
+            pieces.append("标签：" + " ".join(str(x) for x in labels[:6]))
+        if desc:
+            pieces.append(desc[:150])
+        return " ｜ ".join(pieces)
+
     @staticmethod
     def _type_name(media) -> str:
         t = media.type
@@ -348,6 +543,7 @@ class TaskConfirmBridge(_PluginBase):
             "task_id": job.get("task_id"),
             "keyword": job.get("keyword"),
             "state": job.get("state"),
+            "stage": job.get("stage"),
             "count": job.get("count"),
             "selected": job.get("selected"),
             "created_at": job.get("created_at"),
@@ -465,7 +661,17 @@ class TaskConfirmBridge(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {"model": "result_notify", "label": "订阅结果经 MP 通知播报"},
+                                        "props": {"model": "torrent_mode", "label": "选择媒体后搜索资源（二级选择，关闭则直接订阅）"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "result_notify", "label": "结果经 MP 通知播报"},
                                     }
                                 ],
                             },
@@ -484,6 +690,7 @@ class TaskConfirmBridge(_PluginBase):
             "poll_interval": 5,
             "send_center_notify": True,
             "result_notify": True,
+            "torrent_mode": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -503,7 +710,8 @@ class TaskConfirmBridge(_PluginBase):
                     "variant": "tonal",
                     "text": (
                         "用法：在任务确认中心指令框输入「mp 搜索词」→ 本插件搜索媒体 → "
-                        "候选推回确认中心 → 选择后自动添加订阅。\n\n最近记录：\n" + lines
+                        "候选推回确认中心（阶段 1）→ 选择媒体后自动搜索站点资源并推送资源卡片 "
+                        "（阶段 2，含标题/大小/站点/做种数）→ 用户选定资源后停下等待下载接入（阶段 3）。\n\n最近记录：\n" + lines
                     ),
                 },
             }

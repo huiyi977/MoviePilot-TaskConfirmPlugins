@@ -1,14 +1,16 @@
 {
   "TaskConfirmBridge": {
     "name": "任务确认桥接",
-    "description": "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后自动添加订阅。",
-    "labels": "媒体,订阅,任务确认",
-    "version": "1.0.0",
+    "description": "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，二次选择要下载的资源。",
+    "labels": "媒体,订阅,任务确认,资源搜索",
+    "version": "1.1.0",
     "icon": "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmbridge.png",
     "author": "huiyi977",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.0": "新增阶段 2 资源搜索：选中媒体后按 media_source/media_id 调 search_by_id 搜索站点资源，编号展示标题/大小/站点/做种数，推送资源选择卡片并等待用户选定下载（阶段 3 下载另接）；可开关回退为旧版直接订阅。",
+      "v1.0.1": "发布到在线插件市场；新增市场图标与仓库说明。",
       "v1.0.0": "首次发布：mp 搜索词 → 候选确认 → 自动订阅。"
     }
   }
