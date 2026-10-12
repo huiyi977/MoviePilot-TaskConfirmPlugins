@@ -1024,7 +1024,7 @@ class TaskConfirmMax(_PluginBase):
     plugin_desc = ("一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），"
                    "指令框直接输入搜索词；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png"
-    plugin_version = "2.3.0"
+    plugin_version = "2.3.1"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmmax_"
@@ -1669,13 +1669,13 @@ class TaskConfirmMax(_PluginBase):
         if self._notify_minimal:
             text = self._build_minimal_text("MP确认", task.title, url)
         else:
+            # 精简卡片：只给「谁 + 到哪一步 + 有效期 + 入口链接」，不列选项明细
+            # （选项明细在 H5 页面里看；选项多时正文会很长，推送也容易被截断）
             lines = [f"【MP 任务确认】{task.title}"]
             if task.sub_title:
                 lines.append(task.sub_title)
             lines.append(f"有效期 {_fmt_duration(task.timeout_sec)}")
             lines.append("请选择：")
-            lines.extend(f"{i + 1}. {o['text']}" + (f"（{o['desc']}）" if o.get("desc") else "")
-                         for i, o in enumerate(task.options))
             lines.append(f"👉 {url}")
             text = "\n".join(lines)
         pic = self._notify_pic if not (self._notify_minimal and not self._notify_minimal_pic) else ""
