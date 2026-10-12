@@ -30,6 +30,8 @@ https://github.com/huiyi977/MoviePilot-TaskConfirmPlugins
    - Gotify：地址 + Token
    通知渠道 `wecom` / `bark` / `gotify` / `all`（all 三渠道全发）；
    凭证只存在插件配置里，代码不含任何个人信息。
+   通知正文（v2.3.1 起精简）只给「标题 + 当前阶段 + 有效期 + 入口链接」，
+   **不罗列候选项明细**（明细在页面上看），避免长通知被推送渠道截断。
 3. **页面访问**：`http://<主机IP>:<映射端口>/ui/pending`；若配置了 `api_token`，
    页面链接需带 `?token=<api_token>`（通知里的链接会自动带上）。
 
