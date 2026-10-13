@@ -16,6 +16,9 @@
     不再依赖 bark-we-go.sh 等外部脚本（凭证只存在插件配置里，不写死在代码中）
   · 阶段 1 选中媒体后先查媒体库（Emby/Jellyfin/Plex…）：已存在则通知并终止，不再搜资源/下载
     （开关 `check_library`，默认开启）
+  · 阶段 1（媒体）/ 阶段 2（资源）搜索为 0 条或搜索失败时，主动推一条通知告知用户，
+    并提醒去 MP 主页自查（站点/索引器是否正常），不再静默无反应
+    （MP 主页地址可配 `mp_base_url`；留空则自动取 MP 的对外访问地址）
 """
 
 from __future__ import annotations
@@ -66,6 +69,8 @@ HELP_TEXT = """⚡ 任务确认中心 Max - 指令帮助
 【使用提示】
   · 输入搜索词后点「发送」或敲回车即可执行
   · 本版本为 MP 专配版，输入的内容一律当作搜索词处理
+  · 若搜索结果为 0（媒体或资源都没搜到），插件会推一条通知提醒；
+    通知发出后请登录 MP 主页确认站点/索引器是否正常
 """
 
 PAGE_TEMPLATE = """<!doctype html>
@@ -1024,7 +1029,7 @@ class TaskConfirmMax(_PluginBase):
     plugin_desc = ("一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），"
                    "指令框直接输入搜索词；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png"
-    plugin_version = "2.3.1"
+    plugin_version = "2.3.2"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmmax_"
@@ -1035,6 +1040,7 @@ class TaskConfirmMax(_PluginBase):
     _web_host = "0.0.0.0"
     _web_port = 8005
     _public_base_url = ""
+    _mp_base_url = ""
     _api_token = ""
     _max_options = 8
     _task_timeout = 3600
@@ -1079,6 +1085,7 @@ class TaskConfirmMax(_PluginBase):
         self._public_base_url = str(config.get("public_base_url") or "").strip().rstrip("/")
         if not self._public_base_url:
             self._public_base_url = f"http://192.168.5.126:{self._web_port}"
+        self._mp_base_url = str(config.get("mp_base_url") or "").strip().rstrip("/")
         self._api_token = str(config.get("api_token") or "").strip()
         try:
             self._max_options = max(2, min(20, int(config.get("max_options") or 8)))
@@ -1285,8 +1292,12 @@ class TaskConfirmMax(_PluginBase):
             _meta, medias = MediaChain().search(keyword, limit=20)
         except Exception as e:
             logger.error(f"TaskConfirmMax 搜索失败：{e}")
+            self._notify_search_empty("阶段 1 媒体搜索", keyword, f"搜索失败：{e}")
             return {"success": False, "message": f"搜索失败：{e}"}
         if not medias:
+            self._append_history({"task_id": "", "keyword": keyword, "state": "empty"},
+                                 "媒体搜索无结果（0 条）")
+            self._notify_search_empty("阶段 1 媒体搜索", keyword, "结果：0 条（MP 未返回任何媒体条目）")
             return {"success": False, "message": f"未找到与「{keyword}」相关的媒体信息"}
 
         medias = medias[: self._max_options]
@@ -1425,6 +1436,71 @@ class TaskConfirmMax(_PluginBase):
         else:
             logger.info("TaskConfirmMax 通知总开关关闭，媒体库已存在提示未推送")
 
+    # ------------------------------------------------------------------ 搜索为空/失败的通知
+    def _mp_url(self) -> str:
+        """MP 主页地址（用于通知里引导用户去 MP 自查站点/索引器）。
+
+        优先用配置 `mp_base_url`；留空时尝试取 MP 自身的对外访问地址（APP_DOMAIN），
+        取不到就返回空串（通知里就只给文字提示，不给链接）。
+        """
+        if self._mp_base_url:
+            return self._mp_base_url
+        try:
+            from app.core.config import settings
+            domain = str(getattr(settings, "APP_DOMAIN", "") or "").strip().rstrip("/")
+            if domain.startswith(("http://", "https://")) and "localhost" not in domain \
+                    and "127.0.0.1" not in domain:
+                return domain
+        except Exception:
+            pass
+        return ""
+
+    def _record_notice(self, title: str, note: str) -> None:
+        """在确认中心里留一条「提示记录」：只出现在历史里，不作为待确认卡片。"""
+        srv = self._srv
+        if srv is None:
+            return
+        try:
+            t = srv.store.create(title=title[:64], sub_title=note[:512],
+                                 options=[{"key": "notice", "text": note[:128]}],
+                                 timeout_sec=600, style="text")
+            t.result = {"option": "notice", "option_text": note[:128], "clicked_by": "system",
+                        "clicked_at": time.time(), "card_type": "notice"}
+            t.state = "done"
+            t.event.set()
+        except Exception as e:  # noqa: BLE001
+            logger.warn(f"TaskConfirmMax 写入提示记录失败：{e}")
+
+    def _notify_search_empty(self, stage_label: str, keyword: str, detail: str = "") -> None:
+        """阶段 1/2 搜索为 0 条或搜索失败 → 推一条通知，提醒用户去 MP 主页查看。
+
+        走插件内置通知渠道（bark/企微/gotify），受 `notify_enabled` 总开关控制；
+        同时在确认中心的历史里留一条提示记录，方便事后回看。
+        """
+        lines = [f"⚠️ {stage_label}无结果：{keyword}", f"{stage_label}：{keyword}"]
+        if detail:
+            lines.append(detail)
+        mp_url = self._mp_url()
+        if mp_url:
+            lines.append("请登录 MP 主页查看站点/索引器是否正常：")
+            lines.append(f"👉 {mp_url}")
+        else:
+            lines.append("请登录 MP 主页查看站点/索引器是否正常。")
+        text = "\n".join(lines)
+        if self._notify_enabled:
+            threading.Thread(target=self._send_notify_safe, args=(text,), daemon=True).start()
+        else:
+            logger.info("TaskConfirmMax 通知总开关关闭，搜索无结果提示未推送")
+        logger.info(f"TaskConfirmMax {stage_label}无结果：{keyword}（{detail or '无补充信息'}）")
+        self._record_notice(f"⚠️ {stage_label}无结果：{keyword}", detail or f"未搜索到与「{keyword}」相关的结果")
+
+    def _send_notify_safe(self, text: str, pic: str = "") -> None:
+        """后台线程推送通知：失败只记日志，不阻塞主流程。"""
+        try:
+            self._send_notify(text, pic)
+        except Exception as e:  # noqa: BLE001
+            logger.warn(f"TaskConfirmMax 搜索无结果通知发送失败：{e}")
+
     # ------------------------------------------------------------------ 阶段 2：资源搜索
     def _run_torrent_stage(self, job: Dict[str, Any], keyword: str, media, media_text: str):
         """阶段 2：按 media_source/media_id 搜索资源 → 编号推卡片 → 等用户选择。"""
@@ -1435,7 +1511,7 @@ class TaskConfirmMax(_PluginBase):
         if not m_id:
             job["state"] = "error"
             self._append_history(job, "选中媒体缺少 media_id，无法搜索资源")
-            self._notify_result(f"❌ 无法搜索资源：{m_title}", f"选中媒体缺少 media_id\n{media_text}")
+            self._notify_search_empty("阶段 2 资源搜索", m_title, "失败：选中媒体缺少 media_id，无法搜索站点资源")
             return
         self._notify_result(
             f"🔍 正在搜索资源：{m_title}",
@@ -1456,12 +1532,12 @@ class TaskConfirmMax(_PluginBase):
             logger.error(f"TaskConfirmMax 资源搜索异常：{e}")
             job["state"] = "error"
             self._append_history(job, f"资源搜索异常：{e}")
-            self._notify_result(f"❌ 资源搜索失败：{m_title}", f"任务 {job.get('task_id')}\n{e}")
+            self._notify_search_empty("阶段 2 资源搜索", m_title, f"搜索失败：{e}")
             return
         if not contexts:
             job["state"] = "no_torrents"
             self._append_history(job, "资源搜索无结果")
-            self._notify_result(f"❌ 未搜索到资源：{m_title}", f"任务 {job.get('task_id')}")
+            self._notify_search_empty("阶段 2 资源搜索", m_title, "结果：0 条（站点未返回任何资源）")
             return
 
         contexts.sort(key=self._ctx_seeders, reverse=True)
@@ -1482,7 +1558,7 @@ class TaskConfirmMax(_PluginBase):
         if not options:
             job["state"] = "no_torrents"
             self._append_history(job, "资源搜索结果均为空种子信息")
-            self._notify_result(f"❌ 未搜索到有效资源：{m_title}", f"任务 {job.get('task_id')}")
+            self._notify_search_empty("阶段 2 资源搜索", m_title, "结果：0 条有效资源（站点返回的种子信息为空）")
             return
 
         task_id2 = self._create_task(
@@ -1870,6 +1946,8 @@ class TaskConfirmMax(_PluginBase):
                         col("web_host", "监听地址", 6, "0.0.0.0"),
                         col("web_port", "监听端口", 6, "8005"),
                         col("public_base_url", "对外访问地址（通知里的页面链接）", 12, "http://192.168.5.126:8005"),
+                        col("mp_base_url", "MP 主页地址（搜索无结果时通知里引导查看，留空自动取 MP 对外地址）", 12,
+                            "http://192.168.5.126:3005"),
                         col("api_token", "页面/接口鉴权 token（可留空）", 12),
                         col("max_options", "候选/资源数上限", 3),
                         col("task_timeout", "确认任务有效期（秒）", 3),
@@ -1907,6 +1985,7 @@ class TaskConfirmMax(_PluginBase):
             "web_host": "0.0.0.0",
             "web_port": 8005,
             "public_base_url": "http://192.168.5.126:8005",
+            "mp_base_url": "",
             "api_token": "",
             "max_options": 8,
             "task_timeout": 3600,
