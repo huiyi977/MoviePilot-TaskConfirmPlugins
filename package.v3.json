@@ -1,14 +1,15 @@
 {
   "TaskConfirmBridge": {
     "name": "任务确认桥接",
-    "description": "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，二次选定后自动调用默认下载器下载。",
-    "labels": "媒体,订阅,任务确认,资源搜索,下载",
-    "version": "1.2.1",
+    "description": "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，二次选定后自动调用默认下载器下载；含媒体库已存在检查、搜索无结果提醒与内置通知直推（bark/企微/gotify）。",
+    "labels": "媒体,订阅,任务确认,资源搜索,下载,通知",
+    "version": "2.0.0",
     "icon": "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmbridge.png",
     "author": "huiyi977",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v2.0.0": "对齐 TaskConfirmMax 能力（不含内嵌 Web 确认服务，卡片仍由外部确认中心承载）：①选中媒体后先查媒体库（Emby/Jellyfin/Plex 等），已在库则推送通知并终止、跳过资源搜索与下载，开关 check_library 默认开启；②阶段 1/2 搜索结果为 0 条或搜索失败时主动推送通知（带 MP 主页入口，新增配置 mp_base_url，留空自动取 MP 对外访问地址），并在确认中心留一条提示记录，不再静默无反馈；③通知内置直推 bark / 企业微信机器人 / gotify（channel=all 全发）+ 极简模式，不再依赖外部脚本；④新增 builtin_card_notify（默认关闭）：卡片通知可改由插件内置直推（此时建议关闭「让确认中心推送候选通知」避免重复推送）；⑤历史记录持久化，重载配置或重启后仍可见。",
       "v1.2.1": "优化下载器选择卡片标题（去掉资源序号与后续字段，只留资源名）。",
       "v1.2.0": "新增阶段 3 下载：选定资源后自动调用 MP 默认下载器下载（开关 auto_downloader，默认开启）；关闭开关则推送「下载器选择」卡片，列出已启用下载器（默认器带标记）供选择后下载。",
       "v1.1.0": "新增阶段 2 资源搜索：选中媒体后按 media_source/media_id 调 search_by_id 搜索站点资源，编号展示标题/大小/站点/做种数，推送资源选择卡片并等待用户选定下载（阶段 3 下载另接）；可开关回退为旧版直接订阅。",
