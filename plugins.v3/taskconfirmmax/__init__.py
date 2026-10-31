@@ -19,6 +19,9 @@
   · 阶段 1（媒体）/ 阶段 2（资源）搜索为 0 条或搜索失败时，主动推一条通知告知用户，
     并提醒去 MP 主页自查（站点/索引器是否正常），不再静默无反应
     （MP 主页地址可配 `mp_base_url`；留空则自动取 MP 的对外访问地址）
+  · 选中媒体若是**电视剧**，在搜资源之前先问一次：
+    「推荐自动订阅」还是「继续手动搜索」——电视剧集数多、资源杂，
+    逐条挑种子往往翻不完，默认推荐直接订阅由 MP 追更（开关 `tv_choice`，默认开启）
 """
 
 from __future__ import annotations
@@ -1029,7 +1032,7 @@ class TaskConfirmMax(_PluginBase):
     plugin_desc = ("一体化：插件内置 Web 确认服务（默认 0.0.0.0:8005，页面 /ui/pending），"
                    "指令框直接输入搜索词；选媒体→选资源→自动下载，三阶段闭环，专配 MoviePilot。")
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmmax.png"
-    plugin_version = "2.3.2"
+    plugin_version = "2.4.0"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmmax_"
@@ -1051,6 +1054,7 @@ class TaskConfirmMax(_PluginBase):
     _torrent_mode = True
     _auto_downloader = True
     _check_library = True
+    _tv_choice = True
     _notify_enabled = True
     _notify_channel = "wecom"
     _notify_pic = ""
@@ -1108,6 +1112,7 @@ class TaskConfirmMax(_PluginBase):
         self._torrent_mode = bool(config.get("torrent_mode", True))
         self._auto_downloader = bool(config.get("auto_downloader", True))
         self._check_library = bool(config.get("check_library", True))
+        self._tv_choice = bool(config.get("tv_choice", True))
         self._notify_enabled = bool(config.get("notify_enabled", True))
         self._notify_channel = (str(config.get("notify_channel") or "wecom").strip().lower() or "wecom")
         self._notify_pic = str(config.get("notify_pic") or "").strip()
@@ -1360,9 +1365,18 @@ class TaskConfirmMax(_PluginBase):
                 return
 
         if self._torrent_mode:
+            # 电视剧资源往往极多：先问一次「自动订阅 / 手动搜资源」（可在配置里关闭）
+            if self._tv_choice and self._is_tv(media):
+                if not self._ask_tv_mode(job, keyword, media, option_text):
+                    return
             self._run_torrent_stage(job, keyword, media, option_text)
             return
 
+        self._do_subscribe(job, keyword, media, option_text)
+
+    def _do_subscribe(self, job: Dict[str, Any], keyword: str, media, option_text: str) -> None:
+        """添加订阅（直订模式与电视剧分叉共用）。"""
+        task_id = job.get("task_id")
         logger.info(f"TaskConfirmMax 任务 {task_id} 用户已选：{option_text}，开始添加订阅")
         try:
             sub_id, err = SubscribeChain().add(
@@ -1388,6 +1402,68 @@ class TaskConfirmMax(_PluginBase):
         else:
             self._append_history(job, f"订阅失败：{err}")
             self._notify_result(f"❌ 订阅失败：{option_text}", f"任务 {task_id}\n{err or '未知原因'}")
+
+    # ------------------------------------------------------------------ 电视剧分叉
+    @staticmethod
+    def _is_tv(media) -> bool:
+        try:
+            return media.type == MediaType.TV
+        except Exception:
+            return False
+
+    def _ask_tv_mode(self, job: Dict[str, Any], keyword: str, media, media_text: str) -> bool:
+        """电视剧：先让用户在「自动订阅」与「手动搜资源」之间选一次。
+
+        返回 True 表示继续走阶段 2 手动搜索；False 表示已在此收尾（已订阅 / 超时 / 异常）。
+        """
+        m_title = str(getattr(media, "title", "") or keyword)
+        m_year = getattr(media, "year", None) or "未知年份"
+        logger.info(f"TaskConfirmMax 电视剧分叉：{media_text}")
+        options = [
+            {"key": "sub", "text": "✅ 推荐自动订阅（MP 自动追更）",
+             "desc": "交给 MP 订阅任务持续追更，不用逐集挑资源；电视剧集数多、资源杂，这条最省心。"},
+            {"key": "search", "text": "🔍 继续手动搜索资源",
+             "desc": "按这部剧搜索站点资源，自己挑一版下载；资源通常很多，需要多翻几页。"},
+        ]
+        task_id = self._create_task(
+            title=f"电视剧：{m_title}（{m_year}）",
+            sub_title="阶段 2/3 · 这是电视剧，资源通常很多，建议直接自动订阅",
+            options=options,
+        )
+        if not task_id:
+            job["state"] = "error"
+            self._append_history(job, "内嵌确认中心创建电视剧选择任务失败")
+            self._notify_result(f"❌ 电视剧选择卡片推送失败：{m_title}", f"任务 {job.get('task_id')}")
+            return False
+
+        job["state"] = "choosing"
+        job["stage"] = 2
+        job["tv_task_id"] = task_id
+        job["selected"] = media_text
+        self._append_history(job, "电视剧：等待用户选择「自动订阅」或「手动搜资源」")
+
+        final = self._wait_final(task_id)
+        if not final or final.get("state") != "done":
+            job["state"] = "expired" if (final or {}).get("state") == "expired" else "timeout"
+            self._append_history(job, "电视剧分叉未选择或超时")
+            self._notify_result(f"⌛ 电视剧选择超时：{m_title}", f"任务 {task_id}")
+            return False
+
+        choice = str(final.get("option") or "")
+        if choice == "search":
+            job["state"] = "done"
+            self._append_history(job, "用户选择继续手动搜索资源")
+            logger.info(f"TaskConfirmMax 电视剧 {m_title}：用户选择手动搜索资源")
+            return True
+        if choice != "sub":
+            job["state"] = "error"
+            self._append_history(job, f"电视剧分叉返回未知选项：{choice}")
+            return False
+
+        job["state"] = "done"
+        self._append_history(job, "用户选择自动订阅（电视剧）")
+        self._do_subscribe(job, keyword, media, media_text)
+        return False
 
     # ------------------------------------------------------------------ 媒体库检查
     def _library_exists(self, media) -> Optional[Dict[str, Any]]:
@@ -1957,6 +2033,7 @@ class TaskConfirmMax(_PluginBase):
                         switch("torrent_mode", "选媒体后搜索资源（关闭则直接订阅）"),
                         switch("auto_downloader", "阶段 3 自动调用默认下载器（关闭则推送下载器选择卡）"),
                         switch("check_library", "检查媒体库已存在（存在则通知并终止）"),
+                        switch("tv_choice", "电视剧先问一次（自动订阅 / 手动搜资源）"),
                         switch("result_notify", "结果经 MP 通知播报"),
                         {"component": "VCol", "props": {"cols": 12, "md": 12}, "content": [
                             {"component": "VDivider", "props": {"class": "my-2"}}]},
@@ -1995,6 +2072,7 @@ class TaskConfirmMax(_PluginBase):
             "torrent_mode": True,
             "auto_downloader": True,
             "check_library": True,
+            "tv_choice": True,
             "result_notify": True,
             "notify_enabled": True,
             "notify_channel": "wecom",
@@ -2033,7 +2111,8 @@ class TaskConfirmMax(_PluginBase):
                     "text": (
                         head +
                         "用法：打开页面指令框直接输入搜索词 → 选择媒体（阶段 1）→ "
-                        "选择站点资源（阶段 2）→ 自动/指定下载器下载（阶段 3）。\n\n最近记录：\n" + lines
+                        "电视剧会先问「自动订阅 / 手动搜资源」→ 选择站点资源（阶段 2）→ "
+                        "自动/指定下载器下载（阶段 3）。\n\n最近记录：\n" + lines
                     ),
                 },
             }
