@@ -36,14 +36,18 @@ def _fmt_duration(sec: int) -> str:
 
 class TaskConfirmBridge(_PluginBase):
     """
-    任务确认中心桥接（v2.0.0）：确认中心发起「mp 搜索词」→ 本插件搜索媒体 →
+    任务确认中心桥接（v2.1.0）：确认中心发起「mp 搜索词」→ 本插件搜索媒体 →
     候选列表作为确认任务推回中心 → 用户在中心 H5 选择媒体（阶段 1）→
-    查媒体库是否已存在（命中则通知并终止）→ 按 media_source/media_id 搜索站点资源，
+    查媒体库是否已存在（命中则问「跳过 / 继续搜资源洗版」）→
+    电视剧再问一次「自动订阅 / 继续手动搜索」→ 按 media_source/media_id 搜索站点资源，
     编号展示标题/大小/站点/做种数（阶段 2）→ 选定资源后自动用 MP 默认下载器下载
     （阶段 3，可关闭改为推送下载器选择卡片）。
 
     与 TaskConfirmMax 的能力对齐（**不含**内嵌 Web 确认服务，卡片仍由外部确认中心承载）：
-      · 媒体库已存在检查（check_library，默认开启）
+      · 媒体库已存在检查（check_library，默认开启）：命中不直接终止，改为卡片询问
+        「✅ 推荐跳过 / 🔍 继续搜索资源洗版」，超时按跳过处理
+      · 电视剧分叉（tv_choice，默认开启）：选中的是电视剧时先问
+        「✅ 推荐自动订阅 / 🔍 继续手动搜索」，避免在成百上千条资源里翻找
       · 阶段 1/2 搜索为 0 条或搜索失败时主动推送通知（带 MP 主页入口），并在中心留一条提示记录
       · 内置通知直推 bark / 企业微信机器人 / gotify（极简模式可选），不依赖外部脚本
       · 可选 builtin_card_notify：卡片通知改由插件内置直推（默认关闭，仍走确认中心推送）
@@ -52,11 +56,11 @@ class TaskConfirmBridge(_PluginBase):
     plugin_name = "任务确认桥接"
     plugin_desc = (
         "把任务确认中心的「mp 搜索词」转成 MP 媒体搜索，候选推回确认中心选择后再搜索站点资源，"
-        "二次选定后自动调用默认下载器下载；含媒体库已存在检查、搜索无结果提醒与内置通知直推"
-        "（bark/企微/gotify）。"
+        "二次选定后自动调用默认下载器下载；含媒体库已存在询问（跳过/洗版）、电视剧自动订阅询问、"
+        "搜索无结果提醒与内置通知直推（bark/企微/gotify）。"
     )
     plugin_icon = "https://raw.githubusercontent.com/huiyi977/MoviePilot-TaskConfirmPlugins/main/icons/taskconfirmbridge.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "huiyi977"
     author_url = ""
     plugin_config_prefix = "taskconfirmbridge_"
@@ -75,6 +79,7 @@ class TaskConfirmBridge(_PluginBase):
     _torrent_mode = True
     _auto_downloader = True
     _check_library = True
+    _tv_choice = True
     _mp_base_url = ""
     _builtin_card_notify = False
     _notify_enabled = True
@@ -123,6 +128,7 @@ class TaskConfirmBridge(_PluginBase):
         self._torrent_mode = bool(config.get("torrent_mode", True))
         self._auto_downloader = bool(config.get("auto_downloader", True))
         self._check_library = bool(config.get("check_library", True))
+        self._tv_choice = bool(config.get("tv_choice", True))
         self._mp_base_url = str(config.get("mp_base_url") or "").strip().rstrip("/")
         self._builtin_card_notify = bool(config.get("builtin_card_notify", False))
         self._notify_enabled = bool(config.get("notify_enabled", True))
@@ -348,21 +354,34 @@ class TaskConfirmBridge(_PluginBase):
             self._append_history(job, "选中的候选不在本进程缓存中（可能重启过）")
             return
 
-        # 媒体库已存在检查（可在配置里关闭）：命中则通知 + 跳过后续全部阶段
+        # 媒体库已存在检查（可在配置里关闭）：命中则问「跳过 / 继续搜资源洗版」
         if self._check_library:
             exists_info = self._library_exists(media)
             if exists_info:
-                job["state"] = "exists"
-                self._append_history(
-                    job, f"媒体库已存在（{exists_info.get('server') or '媒体服务器'}），已跳过")
-                logger.info(f"TaskConfirmBridge 媒体库已存在，跳过阶段 2/3：{option_text}")
-                self._notify_library_exists(media, exists_info)
+                if self._ask_exists_mode(job, keyword, media, option_text, exists_info) != "search":
+                    return
+                # 用户已明确要洗版：不再问电视剧分叉，直接搜资源
+                self._proceed_after_media(job, keyword, media, option_text, skip_tv=True)
                 return
 
+        self._proceed_after_media(job, keyword, media, option_text)
+
+    def _proceed_after_media(self, job: Dict[str, Any], keyword: str, media, option_text: str,
+                            skip_tv: bool = False) -> None:
+        """媒体确认后的正常推进：搜资源（必要时先问电视剧分叉）或直接订阅。"""
         if self._torrent_mode:
+            # 电视剧资源往往极多：先问一次「自动订阅 / 手动搜资源」（可在配置里关闭）
+            if not skip_tv and self._tv_choice and self._is_tv(media):
+                if not self._ask_tv_mode(job, keyword, media, option_text):
+                    return
             self._run_torrent_stage(job, keyword, media, option_text)
             return
 
+        self._do_subscribe(job, keyword, media, option_text)
+
+    def _do_subscribe(self, job: Dict[str, Any], keyword: str, media, option_text: str) -> None:
+        """添加订阅（直订模式与电视剧分叉共用）。"""
+        task_id = job.get("task_id")
         logger.info(f"TaskConfirmBridge 任务 {task_id} 用户已选：{option_text}，开始添加订阅")
         try:
             sub_id, err = SubscribeChain().add(
@@ -383,13 +402,89 @@ class TaskConfirmBridge(_PluginBase):
             job["state"] = "subscribed"
             job["subscribe_id"] = sub_id
             self._append_history(job, f"已添加订阅 subscribe_id={sub_id}")
-            self._notify_result(
-                f"✅ 已订阅：{option_text}",
-                f"搜索词：{keyword}\n任务：{task_id}\n订阅号：{sub_id}",
-            )
+            self._notify_result(f"✅ 已订阅：{option_text}",
+                                f"搜索词：{keyword}\n任务：{task_id}\n订阅号：{sub_id}")
         else:
             self._append_history(job, f"订阅失败：{err}")
             self._notify_result(f"❌ 订阅失败：{option_text}", f"任务 {task_id}\n{err or '未知原因'}")
+
+    # ------------------------------------------------------------------ 电视剧分叉
+    @staticmethod
+    def _is_tv(media) -> bool:
+        try:
+            return media.type == MediaType.TV
+        except Exception:
+            return False
+
+    def _create_choice_task(self, title: str, sub_title: str,
+                            options: List[Dict[str, Any]]) -> Optional[str]:
+        """在外部确认中心创建一张选择卡片（带通知开关与可选内置直推）。"""
+        payload = {
+            "title": title[:64],
+            "sub_title": sub_title[:512],
+            "style": "text",
+            "options": options,
+            "timeout": self._task_timeout,
+            "notify": self._send_center_notify,
+        }
+        task_id = self._create_center_task(payload)
+        if task_id and self._builtin_card_notify:
+            self._notify_card_builtin(title[:64], sub_title)
+        return task_id
+
+    def _ask_tv_mode(self, job: Dict[str, Any], keyword: str, media, media_text: str) -> bool:
+        """电视剧：先让用户在「自动订阅」与「手动搜资源」之间选一次。
+
+        返回 True 表示继续走阶段 2 手动搜索；False 表示已在此收尾（已订阅 / 超时 / 异常）。
+        """
+        m_title = str(getattr(media, "title", "") or keyword)
+        m_year = getattr(media, "year", None) or "未知年份"
+        logger.info(f"TaskConfirmBridge 电视剧分叉：{media_text}")
+        options = [
+            {"key": "sub", "text": "✅ 推荐自动订阅（MP 自动追更）",
+             "desc": "交给 MP 订阅任务持续追更，不用逐集挑资源；电视剧集数多、资源杂，这条最省心。"},
+            {"key": "search", "text": "🔍 继续手动搜索资源",
+             "desc": "按这部剧搜索站点资源，自己挑一版下载；资源通常很多，需要多翻几页。"},
+        ]
+        task_id = self._create_choice_task(
+            title=f"电视剧：{m_title}（{m_year}）",
+            sub_title="阶段 2/3 · 这是电视剧，资源通常很多，建议直接自动订阅",
+            options=options,
+        )
+        if not task_id:
+            job["state"] = "error"
+            self._append_history(job, "确认中心创建电视剧选择任务失败")
+            self._notify_result(f"❌ 电视剧选择卡片推送失败：{m_title}", f"任务 {job.get('task_id')}")
+            return False
+
+        job["state"] = "choosing"
+        job["stage"] = 2
+        job["tv_task_id"] = task_id
+        job["selected"] = media_text
+        self._append_history(job, "电视剧：等待用户选择「自动订阅」或「手动搜资源」")
+
+        final = self._poll_final(task_id)
+        if not final or final.get("state") != "done":
+            job["state"] = "expired" if (final or {}).get("state") == "expired" else "timeout"
+            self._append_history(job, "电视剧分叉未选择或超时")
+            self._notify_result(f"⌛ 电视剧选择超时：{m_title}", f"任务 {task_id}")
+            return False
+
+        choice = str(final.get("option") or "")
+        if choice == "search":
+            job["state"] = "done"
+            self._append_history(job, "用户选择继续手动搜索资源")
+            logger.info(f"TaskConfirmBridge 电视剧 {m_title}：用户选择手动搜索资源")
+            return True
+        if choice != "sub":
+            job["state"] = "error"
+            self._append_history(job, f"电视剧分叉返回未知选项：{choice}")
+            return False
+
+        job["state"] = "done"
+        self._append_history(job, "用户选择自动订阅（电视剧）")
+        self._do_subscribe(job, keyword, media, media_text)
+        return False
 
     # ------------------------------------------------------------------ 媒体库检查
     def _library_exists(self, media) -> Optional[Dict[str, Any]]:
@@ -418,26 +513,67 @@ class TaskConfirmBridge(_PluginBase):
         server = (getattr(info, "server", None) or getattr(info, "server_type", None) or "")
         return {"server": str(server), "seasons": parts, "text": "、".join(parts)}
 
-    def _notify_library_exists(self, media, info: Dict[str, Any]) -> None:
-        """媒体库已存在 → 发一条通知（内置直推 + MP 原生），随后终止本次任务。"""
-        title = str(getattr(media, "title", "") or "未知媒体")
-        year = getattr(media, "year", None) or "未知年份"
-        lines = [f"ℹ️ 媒体库已存在：{title}", f"媒体：{title}（{year}）"]
-        if info.get("server"):
-            lines.append(f"媒体服务器：{info['server']}")
-        if info.get("text"):
-            lines.append(f"已入库：{info['text']}")
-        lines.append("已跳过资源搜索与下载，本次任务结束。")
-        text = "\n".join(lines)
-        if self._notify_enabled:
-            try:
-                self._send_notify(text)
-            except Exception as e:  # noqa: BLE001
-                logger.warn(f"TaskConfirmBridge 媒体库已存在通知发送失败：{e}")
+    def _ask_exists_mode(self, job: Dict[str, Any], keyword: str, media, media_text: str,
+                         info: Dict[str, Any]) -> str:
+        """媒体库已存在：问「跳过」还是「继续搜资源洗版」。
+
+        返回 "search" 表示继续后面的流程（洗版）；"skip" 表示已在此收尾（跳过 / 超时 / 异常）。
+        """
+        m_title = str(getattr(media, "title", "") or keyword)
+        m_year = getattr(media, "year", None) or "未知年份"
+        server = str(info.get("server") or "媒体服务器")
+        detail = str(info.get("text") or "")
+        have = f"{server} 已有：{detail}" if detail else f"{server} 已有该媒体"
+        if self._torrent_mode:
+            search_text = "🔍 继续搜索资源洗版"
+            search_desc = f"{have}。仍想找更好的版本：继续搜索站点资源，自己挑一版下载。"
+            sub_title = f"阶段 2/3 · {have}，是否继续搜资源洗版"
         else:
-            logger.info("TaskConfirmBridge 通知总开关关闭，媒体库已存在提示未推送")
-        self._notify_result(f"ℹ️ 媒体库已存在：{title}", "\n".join(lines[1:]))
-        self._record_notice(f"ℹ️ 媒体库已存在：{title}", info.get("text") or f"{title}（{year}）已入库")
+            search_text = "🔍 继续（重新订阅洗版）"
+            search_desc = f"{have}。重新添加订阅（已存在则更新），由订阅任务去找更好的版本。"
+            sub_title = f"阶段 2/3 · {have}，是否继续洗版"
+        options = [
+            {"key": "skip", "text": "✅ 推荐跳过（已入库）",
+             "desc": f"{have}。不再搜索与下载，本次任务结束。"},
+            {"key": "search", "text": search_text, "desc": search_desc},
+        ]
+        logger.info(f"TaskConfirmBridge 媒体库已存在，询问是否洗版：{media_text}")
+        task_id = self._create_choice_task(
+            title=f"媒体库已存在：{m_title}（{m_year}）",
+            sub_title=sub_title,
+            options=options,
+        )
+        if not task_id:
+            job["state"] = "error"
+            self._append_history(job, "确认中心创建「媒体库已存在」选择任务失败")
+            self._notify_result(f"❌ 媒体库选择卡片推送失败：{m_title}", f"任务 {job.get('task_id')}")
+            return "skip"
+
+        job["state"] = "choosing"
+        job["stage"] = 2
+        job["exists_task_id"] = task_id
+        job["exists_server"] = server
+        job["selected"] = media_text
+        self._append_history(job, f"媒体库已存在（{server}），等待用户选择「跳过」或「搜资源洗版」")
+
+        final = self._poll_final(task_id)
+        if not final or final.get("state") != "done":
+            job["state"] = "expired" if (final or {}).get("state") == "expired" else "timeout"
+            self._append_history(job, "媒体库已存在但未选择（按跳过处理）")
+            logger.info(f"TaskConfirmBridge 媒体库已存在且未选择，按跳过处理：{media_text}")
+            return "skip"
+
+        choice = str(final.get("option") or "")
+        if choice == "search":
+            job["state"] = "done"
+            self._append_history(job, "媒体库已存在，用户选择继续洗版")
+            logger.info(f"TaskConfirmBridge 媒体库已存在，用户选择洗版：{media_text}")
+            return "search"
+
+        job["state"] = "exists"
+        self._append_history(job, f"媒体库已存在（{server}），用户选择跳过")
+        logger.info(f"TaskConfirmBridge 媒体库已存在，用户选择跳过：{media_text}")
+        return "skip"
 
     # ------------------------------------------------------------------ 搜索为空/失败的通知
     def _mp_url(self) -> str:
@@ -1066,8 +1202,9 @@ class TaskConfirmBridge(_PluginBase):
                         switch("send_center_notify", "让确认中心推送候选通知"),
                         switch("builtin_card_notify", "卡片通知改由插件内置直推（关闭则仍由确认中心推送）"),
                         switch("torrent_mode", "选择媒体后搜索资源（二级选择，关闭则直接订阅）"),
+                        switch("tv_choice", "电视剧先问一次（推荐自动订阅 / 继续手动搜索）"),
                         switch("auto_downloader", "阶段 3 自动调用默认下载器（关闭则推送下载器选择卡片）"),
-                        switch("check_library", "检查媒体库已存在（存在则通知并终止）"),
+                        switch("check_library", "检查媒体库已存在（存在则询问跳过/洗版）"),
                         switch("result_notify", "结果经 MP 通知播报"),
                         divider,
                         switch("notify_enabled", "启用插件内置通知（搜索无结果/媒体库已存在等）"),
@@ -1100,6 +1237,7 @@ class TaskConfirmBridge(_PluginBase):
             "send_center_notify": True,
             "builtin_card_notify": False,
             "torrent_mode": True,
+            "tv_choice": True,
             "auto_downloader": True,
             "check_library": True,
             "result_notify": True,
@@ -1129,7 +1267,8 @@ class TaskConfirmBridge(_PluginBase):
         head = (f"确认中心：{self._center_url or '（未配置）'}\n"
                 f"内置通知：{self._notify_label()}｜"
                 f"卡片通知：{'插件内置直推' if self._builtin_card_notify else '由确认中心推送'}\n"
-                f"媒体库检查：{'开' if self._check_library else '关'}\n\n")
+                f"媒体库检查：{'开（存在则询问跳过/洗版）' if self._check_library else '关'}｜"
+                f"电视剧分叉：{'开' if self._tv_choice else '关'}\n\n")
         return [
             {
                 "component": "VAlert",
@@ -1139,9 +1278,11 @@ class TaskConfirmBridge(_PluginBase):
                     "text": (
                         head +
                         "用法：在任务确认中心指令框输入「mp 搜索词」→ 本插件搜索媒体 → "
-                        "候选推回确认中心（阶段 1）→ 选中媒体先查媒体库（已存在则通知并终止），"
-                        "否则自动搜索站点资源并推送资源卡片（阶段 2，含标题/大小/站点/做种数）→ "
-                        "选定资源后自动用默认下载器下载（阶段 3，关闭自动开关则先推送下载器选择卡片）。\n"
+                        "候选推回确认中心（阶段 1）→ 选中媒体先查媒体库：已存在则问「✅ 推荐跳过 / "
+                        "🔍 继续搜索资源洗版」（超时按跳过）；未入库则继续 → 若是电视剧再问一次"
+                        "「✅ 推荐自动订阅 / 🔍 继续手动搜索」→ 手动搜索则按站点资源推送资源卡片"
+                        "（阶段 2，含标题/大小/站点/做种数）→ 选定资源后自动用默认下载器下载"
+                        "（阶段 3，关闭自动开关则先推送下载器选择卡片）。\n"
                         "阶段 1/2 搜索为 0 条或搜索失败时会主动推送通知（带 MP 主页入口），"
                         "并在确认中心留一条提示记录，不再静默。\n\n最近记录：\n" + lines
                     ),
